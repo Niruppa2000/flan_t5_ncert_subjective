@@ -12,17 +12,14 @@ from pypdf import PdfReader
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-GEN_MODEL_NAME = "google/flan-t5-base"
-TOP_K = 4  # number of chunks to retrieve for context
+GEN_MODEL_NAME = "google/flan-t5-large"   # improved generation quality
+TOP_K = 5
 
 
 # ============================
 # PDF & TEXT UTILITIES
 # ============================
 def extract_text_from_pdf_filelike(file) -> str:
-    """
-    Read text from a PDF uploaded via Streamlit (BytesIO-like object).
-    """
     reader = PdfReader(file)
     pages_text = []
     for page in reader.pages:
@@ -34,9 +31,6 @@ def extract_text_from_pdf_filelike(file) -> str:
 
 
 def build_chunks(text: str, chunk_size: int = 800, overlap: int = 150):
-    """
-    Split large text into overlapping chunks for embedding.
-    """
     chunks = []
     start = 0
     while start < len(text):
@@ -49,9 +43,9 @@ def build_chunks(text: str, chunk_size: int = 800, overlap: int = 150):
 
 
 # ============================
-# MODELS (CACHED)
+# LOAD MODELS
 # ============================
-@st.cache_resource(show_spinner="Loading models (embedding + Flan-T5)...")
+@st.cache_resource(show_spinner="Loading Science Models...")
 def load_models():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     embedder = SentenceTransformer(EMBEDDING_MODEL_NAME, device=device)
@@ -61,189 +55,119 @@ def load_models():
 
 
 # ============================
-# INDEX BUILDING
+# INDEX UTILITIES
 # ============================
-def build_index_from_files(uploaded_files, chunk_size, overlap):
-    """
-    Convert uploaded science PDFs into chunked docs.
-    """
-    docs = []  # list of {"doc_id", "chunk_id", "text"}
+def build_index_from_files(uploaded_files):
+    docs = []
     for f in uploaded_files:
-        raw_text = extract_text_from_pdf_filelike(f)
-        chunks = build_chunks(raw_text, chunk_size, overlap)
-        for idx, ch in enumerate(chunks):
-            docs.append(
-                {
-                    "doc_id": f.name,
-                    "chunk_id": idx,
-                    "text": ch,
-                }
-            )
+        text = extract_text_from_pdf_filelike(f)
+        chunks = build_chunks(text, CHUNK_SIZE, CHUNK_OVERLAP)
+        for idx, c in enumerate(chunks):
+            docs.append({"doc_id": f.name, "chunk_id": idx, "text": c})
     return docs
 
 
 def build_faiss_index(docs, embedder):
-    """
-    Build a FAISS index from chunk embeddings.
-    """
-    emb_dim = embedder.get_sentence_embedding_dimension()
-    index = faiss.IndexFlatL2(emb_dim)
+    dim = embedder.get_sentence_embedding_dimension()
+    index = faiss.IndexFlatL2(dim)
 
-    vectors = []
+    vecs = []
     for d in docs:
-        vec = embedder.encode(d["text"], convert_to_numpy=True, show_progress_bar=False)
-        vectors.append(vec)
+        v = embedder.encode(d["text"], convert_to_numpy=True)
+        vecs.append(v)
 
-    vectors = np.vstack(vectors).astype("float32")
-    index.add(vectors)
-    return index, vectors
+    vecs = np.vstack(vecs).astype("float32")
+    index.add(vecs)
+    return index
 
 
-# ============================
-# RETRIEVAL + PROMPT + GENERATION
-# ============================
-def retrieve_context(query: str, index, embedder, docs, top_k: int = TOP_K):
-    """
-    Retrieve top_k relevant chunks from the FAISS index.
-    """
+def retrieve_context(query, index, embedder, docs):
     q_vec = embedder.encode(query, convert_to_numpy=True).astype("float32")
     q_vec = np.expand_dims(q_vec, axis=0)
-    distances, indices = index.search(q_vec, top_k)
-    indices = indices[0]
-    retrieved = [docs[i] for i in indices]
-    return retrieved
+    scores, indices = index.search(q_vec, TOP_K)
+    return [docs[i] for i in indices[0]]
 
 
-def build_prompt(retrieved_chunks, topic: str, target_class: int, num_questions: int = 5):
-    """
-    Build a prompt for Flan-T5 to generate long-answer science questions.
-    """
-    context_text = "\n\n".join([c["text"] for c in retrieved_chunks])
+# ============================
+# PROMPT + GENERATION
+# ============================
+def build_prompt(topic, chunks, target_class, num_questions):
+    context = "\n\n".join([c["text"] for c in chunks])
 
     prompt = f"""
-You are an experienced NCERT Science teacher for Class {target_class}.
-Using ONLY the context from the NCERT Science textbook below, generate {num_questions} HIGH-QUALITY, long-answer subjective questions.
+You are an NCERT Science teacher for Class {target_class}.
+Generate {num_questions} exam-style LONG ANSWER QUESTIONS ONLY
+based on the topic: "{topic}"
 
-Requirements:
-- Questions should match the difficulty and style of Class {target_class} NCERT Science exam questions.
-- Focus on concepts, explanations, reasoning and applications.
-- No one-word or very short answers; questions must naturally require detailed answers.
-- Do NOT provide answers, only questions.
-- Number the questions clearly as 1., 2., 3., ...
-
-Science Topic: {topic}
+Rules:
+- DO NOT give answers. Only give questions.
+- Questions should start with: Explain, Describe, What do you mean by, How does, Why, etc.
+- Questions must be detailed and require at least 4–8 line answers.
+- Use only the textbook context given below.
 
 CONTEXT:
-{context_text}
+{context}
+
+Now generate the questions:
 """
-    return prompt.strip()
+    return prompt
 
 
-def generate_subjective_questions(
-    topic: str,
-    target_class: int,
-    num_questions: int,
-    index,
-    docs,
-    embedder,
-    tokenizer,
-    gen_model,
-    device,
-    max_new_tokens: int = 420,
-):
-    """
-    Full pipeline: retrieve → build prompt → generate questions text.
-    """
-    retrieved = retrieve_context(topic, index, embedder, docs, top_k=TOP_K)
-    prompt = build_prompt(retrieved, topic, target_class, num_questions)
+def generate_questions(topic, target_class, num_questions, index, docs, embedder, tokenizer, model, device):
+    chunks = retrieve_context(topic, index, embedder, docs)
+    prompt = build_prompt(topic, chunks, target_class, num_questions)
 
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
-    with torch.no_grad():
-        outputs = gen_model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            num_beams=4,
-            no_repeat_ngram_size=3,
-            early_stopping=True,
-        )
-    text = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-    return text, retrieved
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=350,
+            num_beams=5,
+            temperature=0.7,
+            no_repeat_ngram_size=3
+        )
+
+    text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return text, chunks
 
 
 # ============================
 # STREAMLIT UI
 # ============================
 def main():
-    st.set_page_config(page_title="NCERT Science Subjective Question Generator", layout="wide")
-    st.title("🔬 NCERT Science Subjective Question Generator (Classes 6–10)")
+    st.set_page_config(page_title="NCERT Science Question Generator", layout="wide")
+    st.title("🔬 NCERT Science – Long Answer Question Generator (6–10)")
 
-    st.markdown(
-        """
-Upload **NCERT Science PDFs for Classes 6–10**  
-and generate **high-quality, long-answer subjective questions** similar to exam questions.
+    uploaded = st.file_uploader("Upload NCERT Science PDFs (Class 6–10)", type=["pdf"], accept_multiple_files=True)
 
-**Steps:**
-1. Upload Science PDFs for any combination of Classes 6, 7, 8, 9, 10  
-2. Select the class level  
-3. Enter a *Science topic or chapter name*  
-4. Click **Generate** to get detailed subjective questions.
-"""
-    )
+    class_choice = st.selectbox("Select Class", [6, 7, 8, 9, 10], index=2)
+    num_q = st.slider("How many questions?", 3, 10, 5)
+    topic = st.text_input("Enter Topic (Example: Nutrition in Plants, Acids Bases Salts, Motion, Electricity)")
 
-    uploaded_files = st.file_uploader(
-        "Upload NCERT Science PDFs (you can select multiple files)",
-        type=["pdf"],
-        accept_multiple_files=True,
-    )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        target_class = st.selectbox("Select Class", [6, 7, 8, 9, 10], index=2)
-    with col2:
-        num_questions = st.slider("Number of questions", 3, 10, 5)
-
-    if not uploaded_files:
-        st.info("👆 Please upload at least one NCERT **Science** PDF to begin.")
+    if not uploaded:
+        st.info("Please upload at least one NCERT Science PDF.")
         return
 
-    # Load models once
     device, embedder, tokenizer, gen_model = load_models()
 
-    with st.spinner("Reading PDFs and building Science knowledge base..."):
-        docs = build_index_from_files(uploaded_files, CHUNK_SIZE, CHUNK_OVERLAP)
-        if not docs:
-            st.error("No text could be extracted from the uploaded PDFs.")
-            return
-        index, _ = build_faiss_index(docs, embedder)
+    with st.spinner("Processing PDFs and building index..."):
+        docs = build_index_from_files(uploaded)
+        index = build_faiss_index(docs, embedder)
 
-    st.success(f"Indexed {len(docs)} text chunks from {len(uploaded_files)} Science PDF(s).")
-
-    topic = st.text_input(
-        "Enter Science chapter name / topic (e.g., 'Motion and Measurement of Distances', 'Nutrition in Plants', 'Electricity', 'Acids, Bases and Salts')"
-    )
-
-    if topic and st.button("Generate subjective questions"):
-        with st.spinner("Generating science questions..."):
-            questions_text, retrieved = generate_subjective_questions(
-                topic=topic,
-                target_class=target_class,
-                num_questions=num_questions,
-                index=index,
-                docs=docs,
-                embedder=embedder,
-                tokenizer=tokenizer,
-                gen_model=gen_model,
-                device=device,
+    if topic and st.button("Generate Questions"):
+        with st.spinner("Generating questions..."):
+            questions, used_chunks = generate_questions(
+                topic, class_choice, num_q, index, docs, embedder, tokenizer, gen_model, device
             )
 
-        st.subheader("📄 Generated Long-Answer Science Questions")
-        st.write(questions_text)
+        st.subheader("📄 Generated Science Questions")
+        st.write(questions)
 
-        with st.expander("Show textbook context chunks used"):
-            for r in retrieved:
-                st.markdown(f"**{r['doc_id']} – chunk {r['chunk_id']}**")
-                st.write(r["text"])
+        with st.expander("Show textbook chunks used"):
+            for c in used_chunks:
+                st.markdown(f"**{c['doc_id']} – chunk {c['chunk_id']}**")
+                st.write(c["text"])
                 st.markdown("---")
 
 
