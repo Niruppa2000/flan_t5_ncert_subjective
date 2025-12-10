@@ -12,7 +12,7 @@ from pypdf import PdfReader
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-GEN_MODEL_NAME = "google/flan-t5-base"   # use -large if you have enough RAM
+GEN_MODEL_NAME = "google/flan-t5-base"   # change to flan-t5-large if you have more RAM
 TOP_K = 5
 
 
@@ -112,6 +112,59 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
 
 
 # ============================
+# CLEAN & FORCE QUESTION FORMAT
+# ============================
+QUESTION_STARTS = (
+    "what", "why", "how", "when", "where", "which",
+    "explain", "describe", "define", "differentiate",
+    "state", "write", "list", "mention", "discuss"
+)
+
+
+def to_question(text: str) -> str:
+    """
+    Force the generated text into a clear question form.
+    - Remove extra bullets / numbers
+    - Ensure it starts with a question-like phrase
+    - Ensure it ends with '?'
+    """
+    t = text.strip().replace("\n", " ")
+
+    # remove leading bullets / numbers
+    if t[:2].isdigit() and "." in t[:4]:
+        t = t.split(".", 1)[1].strip()
+    if t.startswith("- "):
+        t = t[2:].strip()
+
+    # collapse spaces
+    t = " ".join(t.split())
+
+    lower = t.lower()
+
+    # if it already starts with a question-like word, keep it
+    if not lower.startswith(QUESTION_STARTS):
+        # otherwise, wrap it as "Explain <sentence> ?"
+        # e.g. "acid rain is toxic." -> "Explain why acid rain is toxic."
+        t = t.rstrip(". ")
+        if not lower.startswith("why") and "is" in lower:
+            # crude pattern: "X is Y" -> "Why is X Y?"
+            # Split at first " is "
+            parts = t.split(" is ", 1)
+            if len(parts) == 2:
+                t = f"Why is {parts[0].strip()} is {parts[1].strip()}?"
+            else:
+                t = f"Explain {t}?"
+        else:
+            t = f"Explain {t}?"
+        return t
+
+    # ensure it ends with ?
+    if not t.endswith("?"):
+        t = t.rstrip(". ") + "?"
+    return t
+
+
+# ============================
 # QUESTION GENERATION (UNIQUE)
 # ============================
 def generate_questions(
@@ -128,6 +181,7 @@ def generate_questions(
     """
     Generate EXACTLY num_questions questions.
     Uses semantic similarity to avoid repeating the same question.
+    Also forces every output to be a proper question.
     """
     # 1) Retrieve context once
     chunks = retrieve_context(topic, index, embedder, docs, top_k=TOP_K)
@@ -137,7 +191,6 @@ def generate_questions(
     question_vecs = []
 
     for i in range(num_questions):
-        # Try multiple times to get a different question
         attempt = 0
         best_candidate = None
 
@@ -149,7 +202,7 @@ def generate_questions(
 
             prompt = f"""
 You are an experienced NCERT Science teacher for Class {target_class}.
-Create ONE NEW, DIFFERENT, long-answer exam question for the topic: "{topic}".
+Create ONE NEW, DIFFERENT, exam-style LONG ANSWER question for the topic: "{topic}".
 
 Use ONLY the following NCERT Science textbook context:
 
@@ -157,11 +210,12 @@ Use ONLY the following NCERT Science textbook context:
 
 {already}
 
-Requirements:
-- Output ONLY ONE question sentence.
-- Start with words like: Explain, Describe, What do you mean by, How does, Why, etc.
-- The question must require a detailed answer (4–8 lines).
-- The new question must be semantically different from all existing questions.
+STRICT RULES FOR YOUR OUTPUT:
+- Output MUST be exactly ONE complete question in English.
+- It MUST start with one of: What, Why, How, When, Where, Which, Explain, Describe, Define, Differentiate, State.
+- It MUST end with a question mark "?".
+- Do NOT give the answer.
+- Do NOT add numbering, bullets, or extra text.
 """
 
             inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
@@ -176,23 +230,16 @@ Requirements:
                     num_beams=1,
                     early_stopping=True,
                 )
-            text = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-            text = text.replace("\n", " ").strip()
-
-            # Clean possible numbering / bullets
-            if text[:2].isdigit() and "." in text[:4]:
-                text = text.split(".", 1)[1].strip()
-            if text.startswith("- "):
-                text = text[2:].strip()
-
-            best_candidate = text
+            raw = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+            candidate = to_question(raw)  # force proper question shape
+            best_candidate = candidate
 
             # If it's the first question, accept directly
             if not questions:
                 break
 
             # Check similarity with previous questions
-            cand_vec = embedder.encode(text, convert_to_numpy=True)
+            cand_vec = embedder.encode(candidate, convert_to_numpy=True)
             sims = [cosine_sim(cand_vec, prev) for prev in question_vecs]
             max_sim = max(sims) if sims else 0.0
 
@@ -205,11 +252,10 @@ Requirements:
 
         # After attempts, accept best_candidate anyway
         questions.append(best_candidate)
-        if len(question_vecs) < len(questions):  # first question or fallback
+        if len(question_vecs) < len(questions):
             q_vec = embedder.encode(best_candidate, convert_to_numpy=True)
             question_vecs.append(q_vec)
 
-    # Nicely numbered block
     questions_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
     return questions_block, chunks
 
@@ -224,7 +270,10 @@ def main():
     st.markdown(
         """
 Upload **NCERT Science PDFs for Classes 6–10**  
-and generate **exam-style, long-answer subjective questions**.
+and generate **exam-style, long-answer subjective questions** like:
+
+- *What is photosynthesis?*  
+- *How is photosynthesis helpful to plants? Explain?*
 """
     )
 
@@ -238,7 +287,7 @@ and generate **exam-style, long-answer subjective questions**.
     with col1:
         target_class = st.selectbox("Select Class", [6, 7, 8, 9, 10], index=1)
     with col2:
-        num_questions = st.slider("How many questions?", 1, 10, 5)
+        num_questions = st.slider("How many questions?", 1, 10, 3)
 
     topic = st.text_input(
         "Enter Topic (Example: Nutrition in Plants, Acids Bases Salts, Motion, Electricity)"
@@ -260,7 +309,7 @@ and generate **exam-style, long-answer subjective questions**.
     st.success(f"Indexed {len(docs)} text chunks from {len(uploaded_files)} Science PDF(s).")
 
     if topic and st.button("Generate Questions"):
-        with st.spinner(f"Generating {num_questions} unique science questions..."):
+        with st.spinner(f"Generating {num_questions} science questions..."):
             questions_text, retrieved = generate_questions(
                 topic=topic,
                 target_class=target_class,
