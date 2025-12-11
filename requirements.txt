@@ -1,8 +1,10 @@
-streamlit
+streamlit==1.26.0
 transformers==4.36.2
-torch
-sentencepiece
+tokenizers==0.15.2
+sentencepiece==0.1.99
+torch>=2.0.0
 peft==0.7.1
-accelerate
+huggingface-hub
+
 
 
