@@ -1,10 +1,14 @@
+# requirements.txt
 streamlit==1.26.0
-transformers==4.36.2
+torch>=2.0.0
+transformers==4.37.0
 tokenizers==0.15.2
 sentencepiece==0.1.99
-torch>=2.0.0
-peft==0.7.1
-huggingface-hub
+peft>=0.8.0
+accelerate>=0.20.3
+huggingface-hub>=0.15.1
+
+
 
 
 
