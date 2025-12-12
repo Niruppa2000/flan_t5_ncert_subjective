@@ -11,6 +11,7 @@ if not uploaded:
     st.stop()
 
 try:
+    # uploaded is a BytesIO; decode to text
     text_io = io.TextIOWrapper(uploaded, encoding="utf-8")
     reader = csv.DictReader(text_io)
     rows = [r for r in reader]
@@ -24,10 +25,17 @@ if not required_cols.issubset(set(reader.fieldnames or [])):
     st.stop()
 
 classes = sorted({r["Class"].strip() for r in rows if r.get("Class")})
+if not classes:
+    st.error("No 'Class' values found in CSV.")
+    st.stop()
+
 selected_class = st.selectbox("Select Class", classes)
 
-chapters = sorted({r["Chapter"].strip() for r in rows if r.get("Class") and r["Class"].strip() == str(selected_class)})
-chapter_choice = st.selectbox("Select Chapter", chapters) if chapters else st.text_input("Chapter (none found)")
+chapters_set = sorted({r["Chapter"].strip() for r in rows if r.get("Class") and r["Class"].strip() == str(selected_class)})
+if not chapters_set:
+    chapter_choice = st.text_input("Chapter name (no chapters found for this class)")
+else:
+    chapter_choice = st.selectbox("Select Chapter", chapters_set)
 
 filtered = [r for r in rows if r.get("Class") and r.get("Chapter") and r["Class"].strip() == str(selected_class) and r["Chapter"].strip() == str(chapter_choice)]
 
@@ -40,7 +48,7 @@ else:
         if q:
             st.markdown(f"**{idx}. {q}**")
 
-# Download filtered CSV
+# download filtered CSV
 if filtered:
     out = io.StringIO()
     writer = csv.DictWriter(out, fieldnames=["Class", "Chapter", "Question"])
