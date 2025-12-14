@@ -9,14 +9,13 @@ st.title("📘 NCERT Chapter-wise Question Generator")
 def load_data(file):
     df = pd.read_csv(file)
 
-    # -------- Normalize column names --------
+    # Normalize columns
     df.columns = (
         df.columns
         .str.strip()
         .str.lower()
         .str.replace(" ", "_")
     )
-
     return df
 
 uploaded_file = st.file_uploader("📂 Upload Questions CSV", type=["csv"])
@@ -24,25 +23,15 @@ uploaded_file = st.file_uploader("📂 Upload Questions CSV", type=["csv"])
 if uploaded_file:
     df = load_data(uploaded_file)
 
-    # ✅ Show detected columns (VERY IMPORTANT)
     st.subheader("🧾 Detected CSV Columns")
     st.code(list(df.columns))
 
-    # -------- Expected columns after normalization --------
-    required_columns = {
-        "chapter",
-        "question",
-        "option_a",
-        "option_b",
-        "option_c",
-        "option_d",
-        "answer"
-    }
+    # -------- REQUIRED FOR SUBJECTIVE QUESTIONS --------
+    required_columns = {"chapter", "question"}
 
     missing = required_columns - set(df.columns)
-
     if missing:
-        st.error(f"❌ Missing columns in CSV: {missing}")
+        st.error(f"❌ Missing required columns: {missing}")
         st.stop()
 
     chapter_name = st.text_input("📖 Enter Chapter Name")
@@ -59,12 +48,7 @@ if uploaded_file:
                 random_state=random.randint(1, 9999)
             )
 
+            st.success(f"✅ Showing {len(sample)} questions")
+
             for i, row in enumerate(sample.itertuples(), 1):
                 st.markdown(f"### Q{i}. {row.question}")
-                st.write(f"A. {row.option_a}")
-                st.write(f"B. {row.option_b}")
-                st.write(f"C. {row.option_c}")
-                st.write(f"D. {row.option_d}")
-
-                with st.expander("✅ Show Answer"):
-                    st.write(row.answer)
